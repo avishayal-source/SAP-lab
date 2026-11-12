@@ -1,0 +1,5 @@
+# Python 3.11+
+requests>=2.31.0
+python-dotenv>=1.0.0
+duckdb>=0.10.0
+pytest>=8.0.0
