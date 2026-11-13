@@ -1,77 +1,38 @@
 # SAP Sales Analytics
 
-Small, production-minded Python data engineering learning project. It pulls Sales Order data from the **SAP Business Accelerator Hub** sandbox (OData V2), saves raw JSON, and loads normalized header/item tables into DuckDB.
+Python learning lab that ingests **SAP Sales Order** data from the Business Accelerator Hub sandbox (OData V2), lands raw JSON, normalizes headers/items into **DuckDB**, and explores the result in a read-only **Streamlit** dashboard.
 
-> **Scope:** skeleton + stubs. No live API calls are required to explore the layout. Wire a real sandbox key only when you are ready to ingest.
+Order Value in the UI is **sales-order net amount**, not recognized revenue / billing / FI postings.
+
+> No live SAP API calls are required to explore the layout, run unit tests, or open the dashboard against a local DuckDB file. Wire a sandbox API key only when you are ready to ingest.
 
 ## Stack
 
 - Python 3.11+
 - `requests` — HTTP client (GET only)
-- `python-dotenv` — load secrets from `.env`
+- `python-dotenv` — secrets from `.env`
 - DuckDB — local analytical store
-- `pytest` — unit tests
+- Streamlit + pandas — interactive dashboard
+- `pytest` — unit tests (no network)
 
 No Airflow, Spark, Docker, Kubernetes, or cloud infra.
-
-## SAP sandbox patterns
-
-API Hub sandbox host (typical):
-
-```text
-https://sandbox.api.sap.com/s4hanacloud
-```
-
-Sales Order OData V2 service path:
-
-```text
-/sap/opu/odata/sap/API_SALES_ORDER_SRV
-```
-
-Authenticated with the `APIKey` header (value from Business Accelerator Hub → your sandbox application).
-
-Documented GET endpoints used by this project:
-
-| Purpose | Method | Relative path |
-| --- | --- | --- |
-| Sales order headers | `GET` | `/A_SalesOrder` |
-| Items for one order | `GET` | `/A_SalesOrder('{SalesOrder}')/to_Item` |
-
-Example absolute URLs (do not call until configured):
-
-```text
-GET https://sandbox.api.sap.com/s4hanacloud/sap/opu/odata/sap/API_SALES_ORDER_SRV/A_SalesOrder?$format=json
-GET https://sandbox.api.sap.com/s4hanacloud/sap/opu/odata/sap/API_SALES_ORDER_SRV/A_SalesOrder('5000001')/to_Item?$format=json
-```
-
-## Design rules reflected in the code
-
-1. **GET only** — client exposes read methods; no POST/PATCH/DELETE.
-2. **APIKey from `.env`** — never hard-coded; never logged.
-3. **Timeouts + retries** — transient failures (timeouts, connection errors, 5xx) are retried with backoff.
-4. **Raw JSON landing** — responses written under `data/raw/`.
-5. **Normalize to DuckDB** — headers → `sales_order_header`, items → `sales_order_item`.
-6. **Identifiers as strings** — SAP keys (e.g. `SalesOrder`) stay `VARCHAR`.
-7. **OData V2 dates** — `/Date(milliseconds)/` → timestamps.
-8. **Money as Decimal** — amounts keep decimal precision (not float).
-9. **Validation** — primary keys present; every item references an existing header.
-10. **Secrets hygiene** — `.gitignore` excludes `.env`; `.env.example` has placeholders only.
 
 ## Project layout
 
 ```text
 sap-sales-analytics/
+  app.py                 # Streamlit dashboard (read-only DuckDB)
   src/
-    __init__.py
-    sap_client.py    # Sandbox GET client (APIKey, timeout, retries)
-    ingest.py        # Fetch + save raw JSON under data/raw/
-    transform.py     # Normalize JSON → DuckDB tables
+    sap_client.py        # Sandbox GET client (APIKey, timeout, retries)
+    ingest.py            # Fetch + save raw JSON under data/raw/
+    transform.py         # Normalize JSON → DuckDB tables
   tests/
     test_transform.py
-  data/raw/          # Raw API JSON landing zone
-  sql/               # Optional SQL notes / DDL sketches
+  docs/
+    ui-dashboard.png     # Example Streamlit UI screenshot
+  data/raw/              # Raw API JSON landing zone (gitignored contents)
+  sql/                   # DDL sketches
   .env.example
-  .gitignore
   requirements.txt
   README.md
 ```
@@ -81,41 +42,89 @@ sap-sales-analytics/
 ```bash
 cd sap-sales-analytics
 python3.11 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env and set SAP_API_KEY from the Business Accelerator Hub sandbox app
+# Edit .env and set SAP_API_KEY only if you plan to call the sandbox
 ```
 
-## Run
+## Ingest & transform
 
-Ingest (writes raw JSON; requires a valid sandbox key when you enable live calls):
+Ingest writes raw JSON under `data/raw/` (requires a valid sandbox key when live calls are enabled):
 
 ```bash
 python -m src.ingest
 ```
 
-Transform (reads raw JSON → DuckDB):
+Transform reads raw JSON into DuckDB (`data/sales_analytics.duckdb` by default, gitignored):
 
 ```bash
 python -m src.transform
 ```
 
-Tests (no network):
+Tests (offline):
 
 ```bash
 pytest -q
 ```
 
-## Data notes
+### SAP sandbox patterns
 
-- Raw files land as `data/raw/a_sales_order_*.json` and `data/raw/a_sales_order_items_*.json`.
-- DuckDB default path: `data/sales_analytics.duckdb` (gitignored).
-- Monetary fields (e.g. `TotalNetAmount`, `NetAmount`) are stored with `DECIMAL` precision.
-- Date/time fields (e.g. `CreationDate`, `SalesOrderDate`) are converted from OData V2 `/Date(...)/` literals.
+Host (typical):
 
-## Security
+```text
+https://sandbox.api.sap.com/s4hanacloud
+```
 
-- Put credentials only in `.env` (never in source or commits).
-- The client logs status codes and URLs without the API key value.
+Service path:
+
+```text
+/sap/opu/odata/sap/API_SALES_ORDER_SRV
+```
+
+Auth: `APIKey` header from Business Accelerator Hub → your sandbox application.
+
+| Purpose | Method | Relative path |
+| --- | --- | --- |
+| Sales order headers | `GET` | `/A_SalesOrder` |
+| Items for one order | `GET` | `/A_SalesOrder('{SalesOrder}')/to_Item` |
+
+Design rules: GET only; API key never hard-coded or logged; timeouts + retries; identifiers as strings; OData `/Date(...)/` → timestamps; money as `Decimal`; header/item validation.
+
+## Streamlit dashboard
+
+Read-only POC over `data/sales_analytics.duckdb`. Filters by customer, material, and order date. KPIs and charts stay **currency-safe** (never sum across currencies) and avoid double-counting header totals when items are joined.
+
+```bash
+streamlit run app.py
+```
+
+Windows (venv):
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+### Screenshots
+
+Streamlit UI — KPIs and Order value by customer (sandbox sample data):
+
+![SAP Sales Analytics Streamlit dashboard](docs/ui-dashboard.png)
+
+### Order Value vs revenue
+
+- **Order Value** = sum of item `net_amount` (sales-order net), optionally scoped by filters.
+- Header `total_net_amount` is shown for context only; it is **not** summed on the join (that would double-count).
+- Material filters use **filtered item value**, not the full header amount.
+- This is **not** recognized revenue, billing document value, or FI posting amount.
+
+### Sandbox sample data
+
+SAP Hub sandbox payloads are sample/demo data. Counts, customers, materials, and amounts will not match a real S/4HANA tenant. Treat charts as illustrations of the pipeline and UI, not production analytics.
+
+## Secrets hygiene
+
+- Credentials live only in `.env` (gitignored). Use `.env.example` placeholders.
+- Never commit `.env`, DuckDB databases (`data/*.duckdb`), or raw JSON under `data/raw/`.
+- The HTTP client logs status codes/URLs without the API key value.
 - Rotate the sandbox key if it is ever exposed.
