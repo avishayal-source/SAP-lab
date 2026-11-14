@@ -7,10 +7,15 @@ Order Value here is sales-order net amount, not recognized revenue.
 
 from __future__ import annotations
 
+import sys
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterator
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import duckdb
 import pandas as pd
@@ -27,7 +32,6 @@ from src.order_metrics import (
 )
 from src.sorting import sql_natural_id_order
 
-PROJECT_ROOT = Path(__file__).resolve().parent
 DB_PATH = PROJECT_ROOT / "data" / "sales_analytics.duckdb"
 
 
