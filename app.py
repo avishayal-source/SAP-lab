@@ -16,16 +16,16 @@ import duckdb
 import pandas as pd
 import streamlit as st
 
+from src.order_metrics import (
+    build_filter_clause,
+    load_data_quality,
+    load_order_completeness,
+    load_orders_without_items,
+)
 from src.sorting import sql_natural_id_order
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DB_PATH = PROJECT_ROOT / "data" / "sales_analytics.duckdb"
-
-st.set_page_config(
-    page_title="SAP Sales Analytics",
-    page_icon="📊",
-    layout="wide",
-)
 
 
 @contextmanager
@@ -48,40 +48,6 @@ def format_money(amount: float | None, currency: str) -> str:
     if amount is None or pd.isna(amount):
         return "—"
     return f"{currency} {amount:,.2f}"
-
-
-def build_filter_clause(
-    customers: list[str],
-    materials: list[str],
-    start_date: date | None,
-    end_date: date | None,
-) -> tuple[str, list[Any]]:
-    """
-    Shared WHERE fragment for filtered item-level analytics.
-    Joins headers (h) and items (i); params are bound in order.
-    """
-    clauses: list[str] = ["1=1"]
-    params: list[Any] = []
-
-    if customers:
-        placeholders = ", ".join(["?"] * len(customers))
-        clauses.append(f"h.sold_to_party IN ({placeholders})")
-        params.extend(customers)
-
-    if materials:
-        placeholders = ", ".join(["?"] * len(materials))
-        clauses.append(f"i.material IN ({placeholders})")
-        params.extend(materials)
-
-    if start_date is not None:
-        clauses.append("CAST(h.sales_order_date AS DATE) >= ?")
-        params.append(start_date.isoformat())
-
-    if end_date is not None:
-        clauses.append("CAST(h.sales_order_date AS DATE) <= ?")
-        params.append(end_date.isoformat())
-
-    return " AND ".join(clauses), params
 
 
 def load_filter_options(conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
@@ -132,14 +98,17 @@ def load_filter_options(conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
 
 def load_kpis(conn: duckdb.DuckDBPyConnection, where_sql: str, params: list[Any]) -> pd.DataFrame:
     """
-    KPIs use filtered *item* net amounts (not header totals) so a material
-    filter does not inflate value with full-order header amounts.
-    Totals are kept per currency — never mixed.
+    Currency-safe item-value KPIs after filters.
+
+    Uses filtered *item* net amounts (not header totals) so a material filter
+    does not inflate value with full-order header amounts. Totals stay per
+    currency — never mixed. ``orders_with_matching_items`` is the item-join
+    count for this currency slice, not the header-based Total Sales Orders.
     """
     sql = f"""
         SELECT
             i.transaction_currency AS currency,
-            COUNT(DISTINCT h.sales_order) AS unique_orders,
+            COUNT(DISTINCT h.sales_order) AS orders_with_matching_items,
             COUNT(DISTINCT h.sold_to_party) AS unique_customers,
             COUNT(DISTINCT i.material) AS unique_materials,
             COALESCE(SUM(i.net_amount), 0) AS filtered_item_value
@@ -210,6 +179,7 @@ def load_detail(
     """
     One row per sales-order item. Header total is shown for context only and
     is NOT summed in the UI — value metrics use item net_amount.
+    Orders without items are not listed here (see Orders without items).
     """
     sql = f"""
         SELECT
@@ -230,45 +200,6 @@ def load_detail(
                  {sql_natural_id_order("h.sales_order", "i.sales_order_item")}
     """
     return run_df(conn, sql, params)
-
-
-def load_data_quality(conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    """
-    Header vs item-sum check over the full database (ignores UI filters).
-    Uses all items per order so filter selection cannot hide mismatches.
-    """
-    sql = f"""
-        SELECT
-            h.sales_order,
-            h.transaction_currency AS header_currency,
-            h.total_net_amount AS header_total_net_amount,
-            COALESCE(SUM(i.net_amount), 0) AS item_net_amount_sum,
-            COUNT(i.sales_order_item) AS item_count,
-            ROUND(
-                CAST(h.total_net_amount AS DOUBLE)
-                - CAST(COALESCE(SUM(i.net_amount), 0) AS DOUBLE),
-                2
-            ) AS difference,
-            CASE
-                WHEN ABS(
-                    CAST(COALESCE(h.total_net_amount, 0) AS DOUBLE)
-                    - CAST(COALESCE(SUM(i.net_amount), 0) AS DOUBLE)
-                ) > 0.01 THEN 'Mismatch'
-                ELSE 'OK'
-            END AS status
-        FROM sales_order_header h
-        LEFT JOIN sales_order_item i ON h.sales_order = i.sales_order
-        GROUP BY
-            h.sales_order,
-            h.transaction_currency,
-            h.total_net_amount
-        ORDER BY status DESC, ABS(
-            CAST(COALESCE(h.total_net_amount, 0) AS DOUBLE)
-            - CAST(COALESCE(SUM(i.net_amount), 0) AS DOUBLE)
-        ) DESC,
-        {sql_natural_id_order("h.sales_order")}
-    """
-    return run_df(conn, sql)
 
 
 def render_empty_state(message: str) -> None:
@@ -311,6 +242,12 @@ def render_csv_download(
 
 
 def main() -> None:
+    st.set_page_config(
+        page_title="SAP Sales Analytics",
+        page_icon="📊",
+        layout="wide",
+    )
+
     st.title("SAP Sales Analytics")
     st.caption(
         "SAP Sandbox sample data · **Order Value** = sales-order net amount "
@@ -319,8 +256,9 @@ def main() -> None:
 
     st.sidebar.header("Filters")
     st.sidebar.markdown(
-        "Filters apply to KPIs, charts, and the detail table. "
-        "The data-quality check always uses the full database."
+        "Customer and date filters apply to order counts and item analytics. "
+        "Material filters scope product-specific item results only — they do not "
+        "change Total Sales Orders. Data-quality checks always use the full database."
     )
 
     if not DB_PATH.exists():
@@ -346,7 +284,7 @@ def main() -> None:
                 "Material",
                 options=options["materials"],
                 default=[],
-                help="Empty = all materials",
+                help="Empty = all materials. Scopes item/product metrics only.",
             )
 
             min_d = options["min_date"]
@@ -373,6 +311,12 @@ def main() -> None:
                 customers, materials, start_date, end_date
             )
 
+            completeness = load_order_completeness(
+                conn, customers, materials, start_date, end_date
+            )
+            without_items = load_orders_without_items(
+                conn, customers, start_date, end_date
+            )
             kpis = load_kpis(conn, where_sql, params)
             by_customer = load_value_by_customer(conn, where_sql, params)
             by_material = load_value_by_material(conn, where_sql, params)
@@ -386,26 +330,70 @@ def main() -> None:
     st.markdown(
         """
 **Metric notes**
-- **Filtered item value** — sum of item `net_amount` after sidebar filters (default for KPIs & charts).
-- **Full-order value** — header `total_net_amount`; shown on detail rows for context only; never summed across a filtered item join (avoids double-counting).
-- Currencies are never mixed into one total.
+- **Total Sales Orders** — `COUNT(DISTINCT sales_order)` from `sales_order_header` after customer/date filters (not item-join).
+- **Orders With / Without Items** — item presence via `EXISTS` / `NOT EXISTS` (separate from money).
+- **Filtered item value** — sum of item `net_amount` after filters (default for charts). Currency-safe; never mixes currencies.
+- **Full-order value** — header `total_net_amount`; context only on detail rows; never summed after joining items.
+- **Order Value ≠ recognized revenue.**
         """
     )
 
-    st.subheader("Key metrics")
+    st.subheader("Order completeness")
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "Total Sales Orders",
+        completeness["total_sales_orders"],
+        help="COUNT(DISTINCT sales_order) from sales_order_header (customer/date filters only)",
+    )
+    c2.metric(
+        "Orders With Items",
+        completeness["orders_with_items"],
+        help="Headers that have at least one sales_order_item row",
+    )
+    c3.metric(
+        "Orders Without Items",
+        completeness["orders_without_items"],
+        help="Headers with zero item rows (NOT EXISTS) — missing items, not a money mismatch",
+    )
+
+    if completeness["material_filter_active"]:
+        st.info(
+            f"**Material filter active.** Total Sales Orders (header filters) = "
+            f"{completeness['total_sales_orders']}. "
+            f"Orders matching selected material(s) = "
+            f"{completeness['orders_matching_material']}. "
+            "Charts, currency KPIs, and the item detail table include only matching-item "
+            "orders — unmatched headers are not forced into product-specific results."
+        )
+
+    if completeness["orders_without_items"] > 0:
+        st.warning(
+            f"{completeness['orders_without_items']} order(s) have **zero item rows**. "
+            "This is an item-presence / completeness issue even when header "
+            "`total_net_amount` and the item sum are both zero — it is **not** a "
+            "monetary header-vs-item mismatch."
+        )
+
+    st.subheader("Key metrics (filtered item value)")
     if kpis.empty:
         render_empty_state(
-            "No rows match the current filters. Clear or widen customer, material, or date filters."
+            "No item rows match the current filters. Clear or widen customer, "
+            "material, or date filters. Header-only orders still appear under "
+            "Order completeness / Orders without items."
         )
     else:
         for _, row in kpis.iterrows():
             currency = row["currency"] or "—"
             st.markdown(f"**Currency: {currency}**")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Unique orders", int(row["unique_orders"]))
-            c2.metric("Unique customers", int(row["unique_customers"]))
-            c3.metric("Unique materials", int(row["unique_materials"]))
-            c4.metric(
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric(
+                "Orders with matching items",
+                int(row["orders_with_matching_items"]),
+                help="Distinct orders in this currency after item-level filters — not Total Sales Orders",
+            )
+            k2.metric("Unique customers", int(row["unique_customers"]))
+            k3.metric("Unique materials", int(row["unique_materials"]))
+            k4.metric(
                 "Total filtered item value",
                 format_money(float(row["filtered_item_value"]), currency),
                 help="Sum of item net amounts after filters — not recognized revenue",
@@ -470,6 +458,7 @@ def main() -> None:
     st.caption(
         "One row per item. Sum **item_net_amount** for value analytics. "
         "**header_full_order_value** is the complete order total (context only — do not sum it here). "
+        "Orders without items are listed separately below. "
         "Use **Download detail CSV** below (not the table toolbar) to save on Windows."
     )
     if detail.empty:
@@ -482,7 +471,6 @@ def main() -> None:
             key="download_detail_csv",
         )
         st.dataframe(detail, use_container_width=True, hide_index=True)
-        # Safe totals: item amounts only, never header totals, never cross-currency
         totals = (
             detail.groupby("currency", dropna=False)["item_net_amount"]
             .sum()
@@ -491,19 +479,53 @@ def main() -> None:
         st.markdown("**Detail table totals (item net amount only)**")
         st.dataframe(totals, use_container_width=True, hide_index=True)
 
-    st.subheader("Data quality — header vs item amounts")
+    st.subheader("Orders without items")
     st.caption(
-        "Compares each header `total_net_amount` to the sum of **all** item `net_amount` "
-        "values for that order in the database. Independent of sidebar filters."
+        "Headers with zero `sales_order_item` rows (NOT EXISTS). "
+        "Customer/date filters apply; material filters do not (no items to match). "
+        "Zero header amount + zero items = missing items, not a monetary mismatch."
+    )
+    if without_items.empty:
+        st.success("Every filtered header has at least one item row.")
+    else:
+        st.info(
+            f"{len(without_items)} order(s) with no item rows "
+            "(item-presence issue — separate from financial reconciliation)."
+        )
+        render_csv_download(
+            without_items,
+            label="Download orders-without-items CSV",
+            file_name="orders_without_items.csv",
+            key="download_without_items_csv",
+        )
+        st.dataframe(without_items, use_container_width=True, hide_index=True)
+
+    st.subheader("Data quality — completeness & amounts")
+    st.caption(
+        "Full database (ignores sidebar filters). "
+        "**Missing items** = zero item rows (even when both monetary totals are 0). "
+        "**Mismatch** = items exist but header vs item-sum differs by > 0.01. "
+        "These statuses are mutually exclusive."
     )
     if dq.empty:
         render_empty_state("No header rows available for the data-quality check.")
     else:
+        missing = int((dq["status"] == "Missing items").sum())
         mismatches = int((dq["status"] == "Mismatch").sum())
+        if missing:
+            st.warning(
+                f"{missing} order(s) have **zero item rows** (Missing items). "
+                "Flagged even when header and item monetary totals are both zero."
+            )
         if mismatches:
-            st.warning(f"{mismatches} order(s) have header vs item-sum differences (> 0.01).")
-        else:
-            st.success("All orders: header total_net_amount matches sum of item net_amount.")
+            st.warning(
+                f"{mismatches} order(s) have header vs item-sum differences (> 0.01)."
+            )
+        if not missing and not mismatches:
+            st.success(
+                "All orders have items and header total_net_amount matches "
+                "sum of item net_amount."
+            )
         render_csv_download(
             dq,
             label="Download data-quality CSV",

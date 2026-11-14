@@ -27,9 +27,11 @@ sap-sales-analytics/
     ingest.py            # Fetch + save raw JSON under data/raw/
     transform.py         # Normalize JSON → DuckDB tables
     sorting.py           # Natural sort for sales_order / sales_order_item
+    order_metrics.py     # Header order counts, item completeness, DQ statuses
   tests/
     test_transform.py
     test_sorting.py
+    test_order_metrics.py
   docs/
     ui-dashboard.png     # Example Streamlit UI screenshot
   data/raw/              # Raw API JSON landing zone (gitignored contents)
@@ -116,6 +118,25 @@ Use the **Download … CSV** buttons above each table (detail, customer/material
 Streamlit UI — KPIs and Order value by customer (sandbox sample data):
 
 ![SAP Sales Analytics Streamlit dashboard](docs/ui-dashboard.png)
+
+### KPI definitions
+
+| KPI | Definition |
+| --- | --- |
+| **Total Sales Orders** | `COUNT(DISTINCT sales_order)` from `sales_order_header` after customer/date filters only. Unfiltered sandbox sample = **50**. Not derived from an item join. |
+| **Orders With Items** | Headers that have ≥1 `sales_order_item` row (`EXISTS`). Unfiltered = **48**. |
+| **Orders Without Items** | Headers with zero item rows (`NOT EXISTS` / `LEFT JOIN` + count 0). Unfiltered = **2**. Item-presence issue even when both monetary totals are 0. |
+| **Orders matching material** | Shown only when a material filter is active: distinct headers (after customer/date) with at least one matching item. Total Sales Orders stays header-based; product charts do not force unmatched headers into material results. |
+| **Filtered item value** | `SUM(item.net_amount)` after filters, **per currency**. Never mixes currencies; never sums header totals on an item join. |
+| **Orders with matching items** (currency KPI) | Distinct orders in the filtered item join for that currency — not a replacement for Total Sales Orders. |
+
+Data quality statuses (full DB, ignores UI filters):
+
+- **Missing items** — zero item rows (flagged even when header and item sums are both 0).
+- **Mismatch** — items exist but `|header − Σ items| > 0.01`.
+- **OK** — items exist and amounts reconcile.
+
+Missing items ≠ monetary mismatch.
 
 ### Order Value vs revenue
 
