@@ -97,7 +97,7 @@ Design rules: GET only; API key never hard-coded or logged; timeouts + retries; 
 
 ## Streamlit dashboard
 
-Read-only POC over `data/sales_analytics.duckdb`. Filters by customer, material, and order date. KPIs and charts stay **currency-safe** (never sum across currencies) and avoid double-counting header totals when items are joined.
+Read-only POC over `data/sales_analytics.duckdb`. Filters by customer, material, order date, and overall delivery status. KPIs and charts stay **currency-safe** (never sum across currencies) and avoid double-counting header totals when items are joined.
 
 ```bash
 streamlit run app.py
@@ -126,9 +126,12 @@ Streamlit UI — KPIs and Order value by customer (sandbox sample data):
 | **Total Sales Orders** | `COUNT(DISTINCT sales_order)` from `sales_order_header` after customer/date filters only. Unfiltered sandbox sample = **50**. Not derived from an item join. |
 | **Orders With Items** | Headers that have ≥1 `sales_order_item` row (`EXISTS`). Unfiltered = **48**. |
 | **Orders Without Items** | Headers with zero item rows (`NOT EXISTS` / `LEFT JOIN` + count 0). Unfiltered = **2**. Item-presence issue even when both monetary totals are 0. |
-| **Orders matching material** | Shown only when a material filter is active: distinct headers (after customer/date) with at least one matching item. Total Sales Orders stays header-based; product charts do not force unmatched headers into material results. |
+| **Orders matching material** | Shown only when a material filter is active: distinct headers (after customer/date/delivery-status) with at least one matching item. Total Sales Orders stays header-based; product charts do not force unmatched headers into material results. |
+| **Overall delivery status** | Header `overall_delivery_status` from SAP `OverallDeliveryStatus`. UI: `C` → **Completed delivery**; blank/NULL → **Unknown / Not provided** (not “Not delivered”); other codes as-is. Optional sidebar filter + distribution chart. |
 | **Filtered item value** | `SUM(item.net_amount)` after filters, **per currency**. Never mixes currencies; never sums header totals on an item join. |
 | **Orders with matching items** (currency KPI) | Distinct orders in the filtered item join for that currency — not a replacement for Total Sales Orders. |
+
+**Delivery-status limitations:** codes are stored as returned by the sandbox (no full SAP status catalog). Blank/NULL means the field was empty or absent in the payload — not proven “not delivered”. Existing DuckDB files pick up the column via `ALTER TABLE … ADD COLUMN IF NOT EXISTS` on transform (the DB file is not deleted).
 
 Data quality statuses (full DB, ignores UI filters):
 

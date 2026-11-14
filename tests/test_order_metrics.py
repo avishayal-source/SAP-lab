@@ -8,8 +8,11 @@ import duckdb
 import pytest
 
 from src.order_metrics import (
+    DELIVERY_STATUS_UNKNOWN_LABEL,
     build_filter_clause,
+    format_delivery_status,
     load_data_quality,
+    load_delivery_status_distribution,
     load_order_completeness,
     load_orders_without_items,
 )
@@ -24,20 +27,24 @@ MISSING_ORDER_IDS = ("38", "39")
 # One order carries three item rows; remaining with-items orders have one each
 MULTI_ITEM_ORDER = "1"
 MULTI_ITEM_COUNT = 3
+# Mirror sandbox OverallDeliveryStatus shape: 33× C, 17× blank/NULL
+COMPLETED_DELIVERY_COUNT = 33
+UNKNOWN_DELIVERY_COUNT = 17
 
 
 def _create_schema(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute(
         """
         CREATE TABLE sales_order_header (
-            sales_order            VARCHAR PRIMARY KEY,
-            sales_order_type       VARCHAR,
-            sold_to_party          VARCHAR,
-            sales_organization     VARCHAR,
-            creation_date          TIMESTAMP,
-            sales_order_date       TIMESTAMP,
-            transaction_currency   VARCHAR,
-            total_net_amount       DECIMAL(18, 2)
+            sales_order              VARCHAR PRIMARY KEY,
+            sales_order_type         VARCHAR,
+            sold_to_party            VARCHAR,
+            sales_organization       VARCHAR,
+            creation_date            TIMESTAMP,
+            sales_order_date         TIMESTAMP,
+            transaction_currency     VARCHAR,
+            total_net_amount         DECIMAL(18, 2),
+            overall_delivery_status  VARCHAR
         )
         """
     )
@@ -70,15 +77,37 @@ def _seed_regression_fixture(conn: duckdb.DuckDBPyConnection) -> None:
         # Spread customers / dates for filter tests
         customer = "CUST_A" if n % 2 == 1 else "CUST_B"
         order_date = f"2024-01-{(n % 28) + 1:02d}"
+        # Orders 1..33 → C; 34..50 → NULL (Unknown / Not provided)
+        delivery_status = "C" if n <= COMPLETED_DELIVERY_COUNT else None
         if order_id in MISSING_ORDER_IDS:
             headers.append(
-                (order_id, "OR", customer, "1710", None, order_date, "USD", 0.00)
+                (
+                    order_id,
+                    "OR",
+                    customer,
+                    "1710",
+                    None,
+                    order_date,
+                    "USD",
+                    0.00,
+                    delivery_status,
+                )
             )
             continue
         # Multi-item order: three lines that sum to header total
         if order_id == MULTI_ITEM_ORDER:
             headers.append(
-                (order_id, "OR", customer, "1710", None, order_date, "USD", 30.00)
+                (
+                    order_id,
+                    "OR",
+                    customer,
+                    "1710",
+                    None,
+                    order_date,
+                    "USD",
+                    30.00,
+                    delivery_status,
+                )
             )
             for line, material in enumerate(("MAT_X", "MAT_Y", "MAT_Z"), start=1):
                 items.append(
@@ -87,14 +116,24 @@ def _seed_regression_fixture(conn: duckdb.DuckDBPyConnection) -> None:
             continue
         amount = float(10 + n)
         headers.append(
-            (order_id, "OR", customer, "1710", None, order_date, "USD", amount)
+            (
+                order_id,
+                "OR",
+                customer,
+                "1710",
+                None,
+                order_date,
+                "USD",
+                amount,
+                delivery_status,
+            )
         )
         material = "MAT_X" if n <= 25 else "MAT_Y"
         items.append((order_id, "10", material, 1.0, "EA", amount, "USD"))
 
     conn.executemany(
         """
-        INSERT INTO sales_order_header VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO sales_order_header VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         headers,
     )
@@ -258,3 +297,36 @@ def test_header_amounts_not_double_counted_after_item_join(
     assert float(bad) == float(good_header) * MULTI_ITEM_COUNT
     assert float(good_items) == float(good_header)
     assert float(bad) != float(good_items)
+
+
+def test_format_delivery_status_labels() -> None:
+    assert format_delivery_status("C") == "Completed delivery"
+    assert format_delivery_status(None) == DELIVERY_STATUS_UNKNOWN_LABEL
+    assert format_delivery_status("") == DELIVERY_STATUS_UNKNOWN_LABEL
+    assert format_delivery_status("A") == "A"
+
+
+def test_delivery_status_distribution(conn: duckdb.DuckDBPyConnection) -> None:
+    dist = load_delivery_status_distribution(conn, [], None, None)
+    by_label = {
+        row["delivery_status"]: int(row["order_count"]) for _, row in dist.iterrows()
+    }
+    assert by_label["Completed delivery"] == COMPLETED_DELIVERY_COUNT
+    assert by_label[DELIVERY_STATUS_UNKNOWN_LABEL] == UNKNOWN_DELIVERY_COUNT
+    assert "Not delivered" not in by_label
+    assert sum(by_label.values()) == HEADER_COUNT
+
+
+def test_delivery_status_filter_scopes_header_counts(
+    conn: duckdb.DuckDBPyConnection,
+) -> None:
+    result = load_order_completeness(
+        conn, [], [], None, None, delivery_statuses=["C"]
+    )
+    assert result["total_sales_orders"] == COMPLETED_DELIVERY_COUNT
+    unknown = load_order_completeness(
+        conn, [], [], None, None, delivery_statuses=[None]
+    )
+    assert unknown["total_sales_orders"] == UNKNOWN_DELIVERY_COUNT
+    # Missing-item orders 38/39 are in the unknown bucket
+    assert unknown["orders_without_items"] == ORDERS_WITHOUT_ITEMS

@@ -15,15 +15,39 @@ import pandas as pd
 
 from src.sorting import sql_natural_id_order
 
+# UI label for blank / NULL OverallDeliveryStatus (not "Not delivered").
+DELIVERY_STATUS_UNKNOWN_LABEL = "Unknown / Not provided"
+_DELIVERY_STATUS_LABELS = {
+    "C": "Completed delivery",
+}
+
+
+def format_delivery_status(code: str | None) -> str:
+    """Map SAP OverallDeliveryStatus code to a dashboard label."""
+    if code is None or code == "":
+        return DELIVERY_STATUS_UNKNOWN_LABEL
+    return _DELIVERY_STATUS_LABELS.get(code, code)
+
+
+def delivery_status_code_from_label(label: str) -> str | None:
+    """Inverse of ``format_delivery_status`` for filter selection."""
+    if label == DELIVERY_STATUS_UNKNOWN_LABEL:
+        return None
+    for code, mapped in _DELIVERY_STATUS_LABELS.items():
+        if mapped == label:
+            return code
+    return label
+
 
 def build_header_filter_clause(
     customers: list[str],
     start_date: date | None,
     end_date: date | None,
     *,
+    delivery_statuses: list[str | None] | None = None,
     alias: str = "h",
 ) -> tuple[str, list[Any]]:
-    """WHERE fragment for header-level filters (customer + order date)."""
+    """WHERE fragment for header-level filters (customer, date, delivery status)."""
     clauses: list[str] = ["1=1"]
     params: list[Any] = []
 
@@ -39,6 +63,22 @@ def build_header_filter_clause(
     if end_date is not None:
         clauses.append(f"CAST({alias}.sales_order_date AS DATE) <= ?")
         params.append(end_date.isoformat())
+
+    if delivery_statuses:
+        codes = [s for s in delivery_statuses if s is not None and s != ""]
+        include_unknown = any(s is None or s == "" for s in delivery_statuses)
+        parts: list[str] = []
+        if codes:
+            placeholders = ", ".join(["?"] * len(codes))
+            parts.append(f"{alias}.overall_delivery_status IN ({placeholders})")
+            params.extend(codes)
+        if include_unknown:
+            parts.append(
+                f"({alias}.overall_delivery_status IS NULL "
+                f"OR {alias}.overall_delivery_status = '')"
+            )
+        if parts:
+            clauses.append("(" + " OR ".join(parts) + ")")
 
     return " AND ".join(clauses), params
 
@@ -60,20 +100,64 @@ def build_filter_clause(
     materials: list[str],
     start_date: date | None,
     end_date: date | None,
+    delivery_statuses: list[str | None] | None = None,
 ) -> tuple[str, list[Any]]:
     """
     Shared WHERE for filtered *item-level* analytics (headers ``h`` + items ``i``).
 
     Material filters apply only to item rows; they never invent items for
-    header-only orders.
+    header-only orders. Delivery status is a header attribute.
     """
     header_sql, header_params = build_header_filter_clause(
-        customers, start_date, end_date, alias="h"
+        customers,
+        start_date,
+        end_date,
+        delivery_statuses=delivery_statuses,
+        alias="h",
     )
     material_sql, material_params = build_material_filter_clause(
         materials, alias="i"
     )
     return f"{header_sql} AND {material_sql}", header_params + material_params
+
+
+def load_delivery_status_distribution(
+    conn: duckdb.DuckDBPyConnection,
+    customers: list[str],
+    start_date: date | None,
+    end_date: date | None,
+    delivery_statuses: list[str | None] | None = None,
+) -> pd.DataFrame:
+    """
+    Header count by OverallDeliveryStatus label (customer/date/status filters).
+
+    ``C`` → Completed delivery; blank/NULL → Unknown / Not provided; other codes as-is.
+    """
+    header_where, header_params = build_header_filter_clause(
+        customers,
+        start_date,
+        end_date,
+        delivery_statuses=delivery_statuses,
+        alias="h",
+    )
+    sql = f"""
+        SELECT
+            CASE
+                WHEN h.overall_delivery_status IS NULL
+                     OR h.overall_delivery_status = ''
+                    THEN '{DELIVERY_STATUS_UNKNOWN_LABEL}'
+                WHEN h.overall_delivery_status = 'C' THEN 'Completed delivery'
+                ELSE h.overall_delivery_status
+            END AS delivery_status,
+            COUNT(DISTINCT h.sales_order) AS order_count
+        FROM sales_order_header h
+        WHERE {header_where}
+        GROUP BY 1
+        ORDER BY order_count DESC, delivery_status
+    """
+    if header_params:
+        return conn.execute(sql, header_params).fetchdf()
+    return conn.execute(sql).fetchdf()
 
 
 def load_order_completeness(
@@ -82,20 +166,25 @@ def load_order_completeness(
     materials: list[str],
     start_date: date | None,
     end_date: date | None,
+    delivery_statuses: list[str | None] | None = None,
 ) -> dict[str, Any]:
     """
     Header-based order counts, independent of item-join value KPIs.
 
     - ``total_sales_orders``: COUNT(DISTINCT sales_order) on ``sales_order_header``
-      after customer/date filters only (no material filter; no item join).
+      after customer/date/delivery-status filters (no material filter; no item join).
     - ``orders_with_items`` / ``orders_without_items``: among those headers,
       via EXISTS / NOT EXISTS on ``sales_order_item``.
     - ``orders_matching_material``: only when a material filter is active —
-      distinct headers (after customer/date) that have at least one matching
+      distinct headers (after header filters) that have at least one matching
       item. Unmatched headers are not forced into product-specific results.
     """
     header_where, header_params = build_header_filter_clause(
-        customers, start_date, end_date, alias="h"
+        customers,
+        start_date,
+        end_date,
+        delivery_statuses=delivery_statuses,
+        alias="h",
     )
 
     total_sales_orders = int(
@@ -174,15 +263,20 @@ def load_orders_without_items(
     customers: list[str],
     start_date: date | None,
     end_date: date | None,
+    delivery_statuses: list[str | None] | None = None,
 ) -> pd.DataFrame:
     """
     Header rows with zero item rows (NOT EXISTS).
 
-    Uses customer/date filters only — material filters do not apply because
-    these orders have no items to match.
+    Uses customer/date/delivery-status filters — material filters do not apply
+    because these orders have no items to match.
     """
     header_where, header_params = build_header_filter_clause(
-        customers, start_date, end_date, alias="h"
+        customers,
+        start_date,
+        end_date,
+        delivery_statuses=delivery_statuses,
+        alias="h",
     )
     sql = f"""
         SELECT

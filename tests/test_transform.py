@@ -12,6 +12,7 @@ from src.transform import (
     TransformValidationError,
     deduplicate_headers,
     deduplicate_items,
+    ensure_tables,
     load_into_duckdb,
     normalize_headers,
     normalize_items,
@@ -47,6 +48,7 @@ def test_normalize_headers_keeps_sales_order_as_string() -> None:
             "SalesOrderDate": "/Date(1609459200000)/",
             "TransactionCurrency": "USD",
             "TotalNetAmount": "250.50",
+            "OverallDeliveryStatus": "C",
         }
     ]
     out = normalize_headers(rows)
@@ -54,6 +56,37 @@ def test_normalize_headers_keeps_sales_order_as_string() -> None:
     assert isinstance(out[0]["sales_order"], str)
     assert out[0]["total_net_amount"] == Decimal("250.50")
     assert out[0]["creation_date"] == "2021-01-01T00:00:00+00:00"
+    assert out[0]["overall_delivery_status"] == "C"
+
+
+def test_normalize_headers_overall_delivery_status_blank_to_null() -> None:
+    rows = [
+        {
+            "SalesOrder": "7",
+            "SalesOrderType": "OR",
+            "SoldToParty": "1000",
+            "SalesOrganization": "1710",
+            "CreationDate": "/Date(1609459200000)/",
+            "SalesOrderDate": "/Date(1609459200000)/",
+            "TransactionCurrency": "USD",
+            "TotalNetAmount": "0",
+            "OverallDeliveryStatus": "",
+        },
+        {
+            "SalesOrder": "8",
+            "SalesOrderType": "OR",
+            "SoldToParty": "1000",
+            "SalesOrganization": "1710",
+            "CreationDate": None,
+            "SalesOrderDate": None,
+            "TransactionCurrency": "USD",
+            "TotalNetAmount": "0",
+            # OverallDeliveryStatus omitted
+        },
+    ]
+    out = normalize_headers(rows)
+    assert out[0]["overall_delivery_status"] is None
+    assert out[1]["overall_delivery_status"] is None
 
 
 def test_normalize_items_composite_key_as_strings() -> None:
@@ -98,6 +131,7 @@ def _sample_header(sales_order: str = "5000001", **overrides: object) -> dict:
         "sales_order_date": "2021-01-01T00:00:00+00:00",
         "transaction_currency": "USD",
         "total_net_amount": Decimal("250.50"),
+        "overall_delivery_status": "C",
     }
     row.update(overrides)
     return row
@@ -137,6 +171,21 @@ def test_deduplicate_headers_raises_on_conflicting_duplicate() -> None:
     right = _sample_header(total_net_amount=Decimal("200.00"))
     with pytest.raises(TransformValidationError, match="Conflicting duplicate header"):
         deduplicate_headers([left, right])
+
+
+def test_deduplicate_headers_raises_on_conflicting_delivery_status() -> None:
+    left = _sample_header(overall_delivery_status="C")
+    right = _sample_header(overall_delivery_status=None)
+    with pytest.raises(TransformValidationError, match="Conflicting duplicate header"):
+        deduplicate_headers([left, right])
+
+
+def test_deduplicate_headers_collapses_identical_delivery_status() -> None:
+    out = deduplicate_headers(
+        [_sample_header(overall_delivery_status="C"), _sample_header(overall_delivery_status="C")]
+    )
+    assert len(out) == 1
+    assert out[0]["overall_delivery_status"] == "C"
 
 
 def test_deduplicate_items_keeps_one_identical_duplicate(caplog: pytest.LogCaptureFixture) -> None:
@@ -184,3 +233,76 @@ def test_load_into_duckdb_rolls_back_on_failure(tmp_path: Path) -> None:
 
     assert headers == [("1",)]
     assert items == [("1", "10")]
+
+
+def test_ensure_tables_migrates_overall_delivery_status_on_existing_db(
+    tmp_path: Path,
+) -> None:
+    """Old DBs gain the column via ALTER … ADD COLUMN IF NOT EXISTS (file kept)."""
+    db_path = tmp_path / "legacy.duckdb"
+    conn = duckdb.connect(str(db_path))
+    try:
+        conn.execute(
+            """
+            CREATE TABLE sales_order_header (
+                sales_order            VARCHAR PRIMARY KEY,
+                sales_order_type       VARCHAR,
+                sold_to_party          VARCHAR,
+                sales_organization     VARCHAR,
+                creation_date          TIMESTAMP,
+                sales_order_date       TIMESTAMP,
+                transaction_currency   VARCHAR,
+                total_net_amount       DECIMAL(18, 2)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO sales_order_header VALUES
+            ('1', 'OR', '1000', '1710', NULL, NULL, 'USD', 10.00)
+            """
+        )
+        cols_before = {
+            r[1]
+            for r in conn.execute("PRAGMA table_info('sales_order_header')").fetchall()
+        }
+        assert "overall_delivery_status" not in cols_before
+
+        ensure_tables(conn)
+
+        cols_after = {
+            r[1]
+            for r in conn.execute("PRAGMA table_info('sales_order_header')").fetchall()
+        }
+        assert "overall_delivery_status" in cols_after
+        assert conn.execute(
+            "SELECT sales_order, overall_delivery_status FROM sales_order_header"
+        ).fetchall() == [("1", None)]
+    finally:
+        conn.close()
+
+    assert db_path.exists()
+
+
+def test_load_into_duckdb_persists_overall_delivery_status(tmp_path: Path) -> None:
+    db_path = tmp_path / "sales.duckdb"
+    load_into_duckdb(
+        [
+            _sample_header("1", overall_delivery_status="C"),
+            _sample_header("2", overall_delivery_status=None),
+        ],
+        [_sample_item("1", "10")],
+        db_path=db_path,
+    )
+    conn = duckdb.connect(str(db_path))
+    try:
+        rows = conn.execute(
+            """
+            SELECT sales_order, overall_delivery_status
+            FROM sales_order_header
+            ORDER BY sales_order
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [("1", "C"), ("2", None)]

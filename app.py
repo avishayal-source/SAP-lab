@@ -18,7 +18,10 @@ import streamlit as st
 
 from src.order_metrics import (
     build_filter_clause,
+    delivery_status_code_from_label,
+    format_delivery_status,
     load_data_quality,
+    load_delivery_status_distribution,
     load_order_completeness,
     load_orders_without_items,
 )
@@ -73,6 +76,17 @@ def load_filter_options(conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
             """
         ).fetchall()
     ]
+    delivery_status_labels = sorted(
+        {
+            format_delivery_status(r[0])
+            for r in conn.execute(
+                """
+                SELECT DISTINCT overall_delivery_status
+                FROM sales_order_header
+                """
+            ).fetchall()
+        }
+    )
     date_row = conn.execute(
         """
         SELECT
@@ -91,6 +105,7 @@ def load_filter_options(conn: duckdb.DuckDBPyConnection) -> dict[str, Any]:
     return {
         "customers": customers,
         "materials": materials,
+        "delivery_status_labels": delivery_status_labels,
         "min_date": min_date,
         "max_date": max_date,
     }
@@ -192,6 +207,13 @@ def load_detail(
             i.net_amount AS item_net_amount,
             i.transaction_currency AS currency,
             h.sales_order_date,
+            CASE
+                WHEN h.overall_delivery_status IS NULL
+                     OR h.overall_delivery_status = ''
+                    THEN 'Unknown / Not provided'
+                WHEN h.overall_delivery_status = 'C' THEN 'Completed delivery'
+                ELSE h.overall_delivery_status
+            END AS overall_delivery_status,
             h.total_net_amount AS header_full_order_value
         FROM sales_order_header h
         INNER JOIN sales_order_item i ON h.sales_order = i.sales_order
@@ -256,9 +278,10 @@ def main() -> None:
 
     st.sidebar.header("Filters")
     st.sidebar.markdown(
-        "Customer and date filters apply to order counts and item analytics. "
-        "Material filters scope product-specific item results only — they do not "
-        "change Total Sales Orders. Data-quality checks always use the full database."
+        "Customer, date, and delivery-status filters apply to order counts and "
+        "item analytics. Material filters scope product-specific item results only "
+        "— they do not change Total Sales Orders. Data-quality checks always use "
+        "the full database."
     )
 
     if not DB_PATH.exists():
@@ -286,6 +309,18 @@ def main() -> None:
                 default=[],
                 help="Empty = all materials. Scopes item/product metrics only.",
             )
+            delivery_labels = st.sidebar.multiselect(
+                "Overall delivery status",
+                options=options["delivery_status_labels"],
+                default=[],
+                help=(
+                    "Empty = all statuses. C = Completed delivery; "
+                    "blank/NULL = Unknown / Not provided (not 'Not delivered')."
+                ),
+            )
+            delivery_statuses = [
+                delivery_status_code_from_label(label) for label in delivery_labels
+            ]
 
             min_d = options["min_date"]
             max_d = options["max_date"]
@@ -308,14 +343,17 @@ def main() -> None:
                 start_date, end_date = None, None
 
             where_sql, params = build_filter_clause(
-                customers, materials, start_date, end_date
+                customers, materials, start_date, end_date, delivery_statuses
             )
 
             completeness = load_order_completeness(
-                conn, customers, materials, start_date, end_date
+                conn, customers, materials, start_date, end_date, delivery_statuses
             )
             without_items = load_orders_without_items(
-                conn, customers, start_date, end_date
+                conn, customers, start_date, end_date, delivery_statuses
+            )
+            delivery_dist = load_delivery_status_distribution(
+                conn, customers, start_date, end_date, delivery_statuses
             )
             kpis = load_kpis(conn, where_sql, params)
             by_customer = load_value_by_customer(conn, where_sql, params)
@@ -330,13 +368,33 @@ def main() -> None:
     st.markdown(
         """
 **Metric notes**
-- **Total Sales Orders** — `COUNT(DISTINCT sales_order)` from `sales_order_header` after customer/date filters (not item-join).
+- **Total Sales Orders** — `COUNT(DISTINCT sales_order)` from `sales_order_header` after customer/date/delivery-status filters (not item-join).
 - **Orders With / Without Items** — item presence via `EXISTS` / `NOT EXISTS` (separate from money).
+- **Overall delivery status** — SAP `OverallDeliveryStatus` on the header (`C` = Completed delivery; blank/NULL = Unknown / Not provided).
 - **Filtered item value** — sum of item `net_amount` after filters (default for charts). Currency-safe; never mixes currencies.
 - **Full-order value** — header `total_net_amount`; context only on detail rows; never summed after joining items.
 - **Order Value ≠ recognized revenue.**
         """
     )
+
+    st.subheader("Overall delivery status")
+    st.caption(
+        "Header distribution of SAP OverallDeliveryStatus. "
+        "`C` → Completed delivery; blank/NULL → Unknown / Not provided "
+        "(not 'Not delivered'). Other codes show as returned by SAP."
+    )
+    if delivery_dist.empty:
+        render_empty_state("No headers match the current filters.")
+    else:
+        render_csv_download(
+            delivery_dist,
+            label="Download delivery-status CSV",
+            file_name="overall_delivery_status_distribution.csv",
+            key="download_delivery_status_csv",
+        )
+        chart_df = delivery_dist.set_index("delivery_status")[["order_count"]]
+        st.bar_chart(chart_df, horizontal=True)
+        st.dataframe(delivery_dist, use_container_width=True, hide_index=True)
 
     st.subheader("Order completeness")
     c1, c2, c3 = st.columns(3)

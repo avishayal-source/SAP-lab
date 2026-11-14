@@ -123,6 +123,7 @@ def normalize_headers(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "sales_order_date": parse_odata_v2_date(row.get("SalesOrderDate")),
             "transaction_currency": _as_str(row.get("TransactionCurrency")),
             "total_net_amount": to_decimal(row.get("TotalNetAmount")),
+            "overall_delivery_status": _as_str(row.get("OverallDeliveryStatus")),
         }
         normalized.append(record)
     return normalized
@@ -245,19 +246,27 @@ def validate_relationships(
 
 
 def ensure_tables(conn: duckdb.DuckDBPyConnection) -> None:
-    """Create target tables if they do not exist (identifiers VARCHAR, money DECIMAL)."""
+    """Create target tables if they do not exist; migrate missing columns in place."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sales_order_header (
-            sales_order            VARCHAR PRIMARY KEY,
-            sales_order_type       VARCHAR,
-            sold_to_party          VARCHAR,
-            sales_organization     VARCHAR,
-            creation_date          TIMESTAMP,
-            sales_order_date       TIMESTAMP,
-            transaction_currency   VARCHAR,
-            total_net_amount       DECIMAL(18, 2)
+            sales_order              VARCHAR PRIMARY KEY,
+            sales_order_type         VARCHAR,
+            sold_to_party            VARCHAR,
+            sales_organization       VARCHAR,
+            creation_date            TIMESTAMP,
+            sales_order_date         TIMESTAMP,
+            transaction_currency     VARCHAR,
+            total_net_amount         DECIMAL(18, 2),
+            overall_delivery_status  VARCHAR
         )
+        """
+    )
+    # Existing DBs created before this column: add in place (do not delete the DB file).
+    conn.execute(
+        """
+        ALTER TABLE sales_order_header
+        ADD COLUMN IF NOT EXISTS overall_delivery_status VARCHAR
         """
     )
     conn.execute(
@@ -297,7 +306,7 @@ def load_into_duckdb(
             for row in headers:
                 conn.execute(
                     """
-                    INSERT INTO sales_order_header VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO sales_order_header VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         row["sales_order"],
@@ -308,6 +317,7 @@ def load_into_duckdb(
                         row["sales_order_date"],
                         row["transaction_currency"],
                         row["total_net_amount"],
+                        row["overall_delivery_status"],
                     ],
                 )
 
