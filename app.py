@@ -262,7 +262,9 @@ def load_data_quality(conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
         ORDER BY status DESC, ABS(
             CAST(COALESCE(h.total_net_amount, 0) AS DOUBLE)
             - CAST(COALESCE(SUM(i.net_amount), 0) AS DOUBLE)
-        ) DESC, h.sales_order
+        ) DESC,
+        TRY_CAST(h.sales_order AS BIGINT) NULLS LAST,
+        h.sales_order
     """
     return run_df(conn, sql)
 
