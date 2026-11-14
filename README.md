@@ -107,6 +107,10 @@ Windows (venv):
 .\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
+### CSV export (Windows)
+
+Use the **Download … CSV** buttons above each table (detail, customer/material/month, data quality). They call Streamlit `st.download_button` with explicit CSV bytes (`mime="text/csv"`, UTF-8 BOM for Excel). Prefer those buttons over the dataframe toolbar’s built-in Download CSV control, which on Windows often opens a save dialog without writing the file.
+
 ### Screenshots
 
 Streamlit UI — KPIs and Order value by customer (sandbox sample data):

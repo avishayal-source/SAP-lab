@@ -275,6 +275,41 @@ def render_empty_state(message: str) -> None:
     st.info(message)
 
 
+def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """
+    Encode a DataFrame as CSV bytes for st.download_button.
+
+    Uses UTF-8 with BOM so Excel on Windows opens Hebrew/special characters
+    correctly. index=False keeps the export aligned with the on-screen table.
+    """
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def render_csv_download(
+    df: pd.DataFrame,
+    *,
+    label: str,
+    file_name: str,
+    key: str,
+) -> None:
+    """
+    Reliable CSV export via browser download (works on Windows).
+
+    Prefer this over the st.dataframe toolbar Download CSV control, which
+    often opens a save dialog on Windows without writing the file.
+    """
+    if df.empty:
+        return
+    st.download_button(
+        label=label,
+        data=dataframe_to_csv_bytes(df),
+        file_name=file_name,
+        mime="text/csv",
+        key=key,
+        help="Downloads the table currently shown (after sidebar filters).",
+    )
+
+
 def main() -> None:
     st.title("SAP Sales Analytics")
     st.caption(
@@ -381,6 +416,12 @@ def main() -> None:
     if by_customer.empty:
         render_empty_state("No customer values for the current filters.")
     else:
+        render_csv_download(
+            by_customer,
+            label="Download customer values CSV",
+            file_name="order_value_by_customer.csv",
+            key="download_by_customer_csv",
+        )
         for currency, grp in by_customer.groupby("currency", dropna=False):
             st.markdown(f"**{currency}**")
             chart_df = grp.set_index("customer")[["filtered_item_value"]]
@@ -396,6 +437,12 @@ def main() -> None:
     if by_material.empty:
         render_empty_state("No material values for the current filters.")
     else:
+        render_csv_download(
+            by_material,
+            label="Download material values CSV",
+            file_name="order_value_by_material.csv",
+            key="download_by_material_csv",
+        )
         for currency, grp in by_material.groupby("currency", dropna=False):
             st.markdown(f"**{currency}**")
             chart_df = grp.set_index("material")[["filtered_item_value"]]
@@ -407,6 +454,12 @@ def main() -> None:
     if by_month.empty:
         render_empty_state("No monthly values for the current filters.")
     else:
+        render_csv_download(
+            by_month,
+            label="Download monthly values CSV",
+            file_name="order_value_by_month.csv",
+            key="download_by_month_csv",
+        )
         for currency, grp in by_month.groupby("currency", dropna=False):
             st.markdown(f"**{currency}**")
             chart_df = grp.set_index("order_month")[["filtered_item_value"]]
@@ -416,11 +469,18 @@ def main() -> None:
     st.subheader("Order / item detail")
     st.caption(
         "One row per item. Sum **item_net_amount** for value analytics. "
-        "**header_full_order_value** is the complete order total (context only — do not sum it here)."
+        "**header_full_order_value** is the complete order total (context only — do not sum it here). "
+        "Use **Download detail CSV** below (not the table toolbar) to save on Windows."
     )
     if detail.empty:
         render_empty_state("No detail rows for the current filters.")
     else:
+        render_csv_download(
+            detail,
+            label="Download detail CSV",
+            file_name="sales_order_item_detail.csv",
+            key="download_detail_csv",
+        )
         st.dataframe(detail, use_container_width=True, hide_index=True)
         # Safe totals: item amounts only, never header totals, never cross-currency
         totals = (
@@ -444,6 +504,12 @@ def main() -> None:
             st.warning(f"{mismatches} order(s) have header vs item-sum differences (> 0.01).")
         else:
             st.success("All orders: header total_net_amount matches sum of item net_amount.")
+        render_csv_download(
+            dq,
+            label="Download data-quality CSV",
+            file_name="data_quality_header_vs_items.csv",
+            key="download_dq_csv",
+        )
         st.dataframe(dq, use_container_width=True, hide_index=True)
 
     st.divider()
