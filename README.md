@@ -26,8 +26,10 @@ sap-sales-analytics/
     sap_client.py        # Sandbox GET client (APIKey, timeout, retries)
     ingest.py            # Fetch + save raw JSON under data/raw/
     transform.py         # Normalize JSON → DuckDB tables
+    sorting.py           # Natural sort for sales_order / sales_order_item
   tests/
     test_transform.py
+    test_sorting.py
   docs/
     ui-dashboard.png     # Example Streamlit UI screenshot
   data/raw/              # Raw API JSON landing zone (gitignored contents)
@@ -117,6 +119,16 @@ Streamlit UI — KPIs and Order value by customer (sandbox sample data):
 - Header `total_net_amount` is shown for context only; it is **not** summed on the join (that would double-count).
 - Material filters use **filtered item value**, not the full header amount.
 - This is **not** recognized revenue, billing document value, or FI posting amount.
+
+### Sales order ID sorting
+
+`sales_order` and `sales_order_item` stay **VARCHAR/string** everywhere (DuckDB, joins, filters, UI). For display order, use natural numeric sorting via `src/sorting.py`:
+
+```sql
+ORDER BY TRY_CAST(sales_order AS BIGINT) NULLS LAST, sales_order
+```
+
+Numeric-only IDs sort as 1, 2, 10, 13 (not lexicographic 1, 10, 13, 2); leading zeros are preserved in display; non-numeric IDs sort lexicographically after numeric ones. Dashboard detail and data-quality tables use `sql_natural_id_order()`; pandas helpers are available for future dataframes.
 
 ### Sandbox sample data
 

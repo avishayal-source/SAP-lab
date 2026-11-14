@@ -16,6 +16,8 @@ import duckdb
 import pandas as pd
 import streamlit as st
 
+from src.sorting import sql_natural_id_order
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 DB_PATH = PROJECT_ROOT / "data" / "sales_analytics.duckdb"
 
@@ -224,7 +226,8 @@ def load_detail(
         FROM sales_order_header h
         INNER JOIN sales_order_item i ON h.sales_order = i.sales_order
         WHERE {where_sql}
-        ORDER BY h.sales_order_date, h.sales_order, i.sales_order_item
+        ORDER BY h.sales_order_date,
+                 {sql_natural_id_order("h.sales_order", "i.sales_order_item")}
     """
     return run_df(conn, sql, params)
 
@@ -234,7 +237,7 @@ def load_data_quality(conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     Header vs item-sum check over the full database (ignores UI filters).
     Uses all items per order so filter selection cannot hide mismatches.
     """
-    sql = """
+    sql = f"""
         SELECT
             h.sales_order,
             h.transaction_currency AS header_currency,
@@ -263,8 +266,7 @@ def load_data_quality(conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
             CAST(COALESCE(h.total_net_amount, 0) AS DOUBLE)
             - CAST(COALESCE(SUM(i.net_amount), 0) AS DOUBLE)
         ) DESC,
-        TRY_CAST(h.sales_order AS BIGINT) NULLS LAST,
-        h.sales_order
+        {sql_natural_id_order("h.sales_order")}
     """
     return run_df(conn, sql)
 
